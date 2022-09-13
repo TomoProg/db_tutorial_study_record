@@ -1,0 +1,6 @@
+db
+*.db
+_site/
+TODO
+.idea/
+.vscode
