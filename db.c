@@ -7,6 +7,63 @@
 #include <string.h>
 #include <unistd.h>
 
+typedef struct {
+	char* buffer;
+	size_t buffer_length; // size_tって何やっけ？
+	ssize_t input_length; // ssize_tって何やっけ？
+} InputBuffer;
+
+InputBuffer* new_input_buffer() {
+	InputBuffer* input_buffer = (InputBuffer*)malloc(sizeof(InputBuffer));
+	input_buffer->buffer = NULL;
+	input_buffer->buffer_length = 0;
+	input_buffer->input_length = 0;
+
+	return input_buffer;
+}
+
+void print_prompt() {
+	printf("db > ");
+}
+
+void read_input(InputBuffer* input_buffer) {
+	// getlineのリファレンス
+	// https://kazmax.zpp.jp/cmd/g/getline.3.html
+	// 第1引数:入力した文字が改行ありで入る
+	// 第2引数:bufferに割り当てられたサイズが入る
+	// getlineの中でメモリ割当されている
+	ssize_t bytes_read = getline(&(input_buffer->buffer), &(input_buffer->buffer_length), stdin);
+	if(bytes_read <= 0) {
+		printf("Error reading input\n");
+		exit(EXIT_FAILURE);
+	}
+
+	// getlineは改行を含むため、改行を削除している
+	// for debug
+	//printf("%s", input_buffer->buffer);
+	//printf("buffer_length: %ld\n", input_buffer->buffer_length);
+	//printf("bytes_read: %ld\n", bytes_read);
+	//
+	input_buffer->input_length = bytes_read - 1;
+	input_buffer->buffer[bytes_read - 1] = 0;
+}
+
+void close_input_buffer(InputBuffer* input_buffer) {
+	free(input_buffer->buffer);
+	free(input_buffer);
+}
+
 int main(int argc, char* argv[]) {
-	printf("Hello db world!!!\n");
+	InputBuffer* input_buffer = new_input_buffer();
+	while(true) {
+		print_prompt();
+		read_input(input_buffer);
+
+		if(strcmp(input_buffer->buffer, ".exit") == 0) {
+			close_input_buffer(input_buffer);
+			exit(EXIT_SUCCESS);
+		} else {
+			printf("Unrecognized command '%s'.\n", input_buffer->buffer);
+		}
+	}
 }
