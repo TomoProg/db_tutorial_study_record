@@ -116,18 +116,62 @@ const uint32_t TABLE_MAX_ROWS = ROWS_PER_PAGE * TABLE_MAX_PAGES;	// テーブル
 // |                                          |
 // *------------------------------------------*
 typedef struct {
-	uint32_t num_rows;
+	int file_descriptor;
+	uint32_t file_length;
 	void* pages[TABLE_MAX_PAGES];
+} Pager;
+
+typedef struct {
+	Pager* pager;
+	uint32_t num_rows;
 } Table;
+
+void *get_page(Pager* pager, uint32_t page_num) {
+	// バリデーション
+	if(page_num > TABLE_MAX_PAGES) {
+		printf("Tried to fetch page number out of bounds. %d > %d\n", page_num, TABLE_MAX_PAGES);
+		exit(EXIT_FAILURE);
+	}
+
+	if(pager->pages[page_num] == NULL) {
+		// ページがまだ読み込まれていない場合はファイルから読み込む
+		void* page = malloc(PAGE_SIZE);
+		uint32_t num_pages = pager->file_length / PAGE_SIZE;
+
+		// ページに区切れない分のデータがある場合は1ページ分増やしておく
+		// 例
+		//   ファイル長（file_length）: 6
+		//   ページサイズ（PAGE_SIZE）: 3
+		//   ファイルをページで区切ると2ページ、余りはないため、2ページ必要
+		//
+		// 例
+		//   ファイル長（file_length）: 8
+		//   ページサイズ（PAGE_SIZE）: 3
+		//   ファイルをページで区切ると2ページ、ただし、余りがあるため、余った分を入れるために+1ページして3ページ必要
+		if(pager->file_length % PAGE_SIZE) {
+			num_pages += 1;
+		}
+
+		if(page_num <= num_pages) {
+			lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+			ssize_t bytes_read = read(pager->file_descriptor, page, PAGE_SIZE);
+			if(bytes_read == -1) {
+				 // エラー処理 read関数は失敗時に-1を返す
+				printf("Error reading file: %d\n", errno);
+				exit(EXIT_FAILURE);
+			}
+		}
+
+		pager->pages[page_num] = page;
+	}
+
+	return pager->pages[page_num];
+}
 
 // 指定された行がテーブルのどの位置にあるのかを計算する
 void* row_slot(Table* table, uint32_t row_num) {
 	uint32_t page_num = row_num / ROWS_PER_PAGE; // 指定された行がどのページにあるのかを算出
-	void* page = table->pages[page_num];
-	if(page == NULL) {
-		// ページがなければメモリ確保する
-		page = table->pages[page_num] = malloc(PAGE_SIZE);
-	}
+	void* page = get_page(table->pager, page_num);
 
 	// 指定された行がどのテーブルのどの位置にあるのかを算出
 	uint32_t row_offset = row_num % ROWS_PER_PAGE;	// ページで見たときの行の位置を算出
@@ -175,8 +219,78 @@ void close_input_buffer(InputBuffer* input_buffer) {
 	free(input_buffer);
 }
 
-MetaCommandResult do_meta_command(InputBuffer* input_buffer) {
+void pager_flush(Pager* pager, uint32_t page_num, uint32_t size) {
+	if(pager->pages[page_num] == NULL) {
+		// 指定したページが空であればフラッシュできないのでエラーとする
+		printf("Tried to flush null page\n");
+		exit(EXIT_FAILURE);
+	}
+
+	// 書き込み位置に移動
+	off_t offset = lseek(pager->file_descriptor, page_num * PAGE_SIZE, SEEK_SET);
+
+	if(offset == -1) {
+		printf("Error seeking: %d\n", errno);
+		exit(EXIT_FAILURE);
+	}
+
+	// ページを書き込む
+	ssize_t bytes_written = 
+		write(pager->file_descriptor, pager->pages[page_num], size);
+
+	if(bytes_written == -1) {
+		printf("Error writing: %d\n", errno);
+		exit(EXIT_FAILURE);
+	}
+}
+
+void db_close(Table* table) {
+	Pager* pager = table->pager;
+	uint32_t num_full_pages = table->num_rows / ROWS_PER_PAGE;
+
+	// すべてのページをフラッシュする
+	// フラッシュ時にファイルに書き出される
+	for(uint32_t i = 0; i < num_full_pages; i++) {
+		if(pager->pages[i] == NULL) {
+			continue;
+		}
+		pager_flush(pager, i, PAGE_SIZE);
+		free(pager->pages[i]);
+		pager->pages[i] = NULL;
+	}
+
+	// ページに満たない分の行を末尾にフラッシュする
+	// B-Treeを実装すればこれは不要になるとのこと
+	uint32_t num_additional_rows = table->num_rows % ROWS_PER_PAGE;
+	if(num_additional_rows > 0) {
+		uint32_t page_num = num_full_pages;
+		if(pager->pages[page_num] != NULL) {
+			pager_flush(pager, page_num, num_additional_rows * ROW_SIZE);
+			free(pager->pages[page_num]);
+			pager->pages[page_num] = NULL;
+		}
+	}
+
+	// ファイルクローズおよびメモリ解放
+	int result = close(pager->file_descriptor);
+	if(result == -1) {
+		printf("Error closing db file.\n");
+		exit(EXIT_FAILURE);
+	}
+	for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
+		void* page = pager->pages[i];
+		if(page) {
+			free(page);
+			pager->pages[i] = NULL;
+		}
+	}
+	free(pager);
+	free(table);
+}
+
+MetaCommandResult do_meta_command(InputBuffer* input_buffer, Table* table) {
 	if(strcmp(input_buffer->buffer, ".exit") == 0) {
+		db_close(table);
 		exit(EXIT_FAILURE);
 	} else {
 		return META_COMMAND_UNRECOGNIZED_COMMAND;
@@ -264,24 +378,55 @@ ExecuteResult execute_statement(Statement* statement, Table* table) {
 	}
 }
 
-Table* new_table() {
-	Table* table = (Table*)malloc(sizeof(Table));
-	table->num_rows = 0;
-	for(uint32_t i = 0; i < TABLE_MAX_PAGES; i++) {
-		table->pages[i] = NULL;
+Pager* pager_open(const char* filename) {
+	// 第1引数: 開くファイルの名称
+	// 第2引数: ファイルの読み書きの指定
+	// 第3引数: 作成するファイルの初期の権限
+	int fd = open(filename,
+				O_RDWR |		// 読み書き可能モード
+					O_CREAT,	// ファイルが存在しない場合は作成する
+				S_IWUSR | 		// 書き込み権限
+					S_IRUSR 	// 読み込み権限
+				);
+
+	if(fd == -1) {
+		printf("Unable to open file\n");
+		exit(EXIT_FAILURE);
 	}
+
+	off_t file_length = lseek(fd, 0, SEEK_END);
+
+	Pager* pager = malloc(sizeof(Pager));
+	pager->file_descriptor = fd;
+	pager->file_length = file_length;
+
+	for(uint32_t i = 0 ; i < TABLE_MAX_PAGES; i++) {
+		pager->pages[i] = NULL;
+	}
+
+	return pager;
+}
+
+Table* db_open(const char* filename) {
+	Pager* pager = pager_open(filename);
+	uint32_t num_rows = pager->file_length / ROW_SIZE;
+
+	Table* table = (Table*)malloc(sizeof(Table));
+	table->pager = pager;
+	table->num_rows = num_rows;
 	return table;
 }
 
-void free_table(Table* table) {
-	for(int i = 0; table->pages[i]; i++) {
-		free(table->pages[i]);
-	}
-	free(table);
-}
-
 int main(int argc, char* argv[]) {
-	Table* table = new_table();
+	if(argc < 2) {
+		// 必ずデータベースファイルを受け取る
+		printf("Must supply a database filename.\n");
+		exit(EXIT_FAILURE);
+	}
+
+	char* filename = argv[1];
+	Table* table = db_open(filename);
+
 	InputBuffer* input_buffer = new_input_buffer();
 	while(true) {
 		print_prompt();
@@ -290,7 +435,7 @@ int main(int argc, char* argv[]) {
 		// SQLiteのメタコマンドかどうかを確認する
 		// 先頭が"."であれば、メタコマンド
 		if(input_buffer->buffer[0] == '.') {
-			switch(do_meta_command(input_buffer)) {
+			switch(do_meta_command(input_buffer, table)) {
 				case(META_COMMAND_SUCCESS):
 					continue;
 				case(META_COMMAND_UNRECOGNIZED_COMMAND):
