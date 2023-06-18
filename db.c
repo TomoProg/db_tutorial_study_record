@@ -126,6 +126,33 @@ typedef struct {
 	uint32_t num_rows;
 } Table;
 
+typedef struct {
+	Table* table;
+	uint32_t row_num;
+	// 最後の要素から一つ前の位置を示す。
+	// C言語でbool使えるの知らんかった。
+	// 行を挿入したい場所を特定するために使う。
+	bool end_of_table;
+} Cursor;
+
+Cursor* table_start(Table* table) {
+	Cursor* cursor = malloc(sizeof(Cursor));
+	cursor->table = table;
+	cursor->row_num = 0;
+	cursor->end_of_table = (table->num_rows == 0);
+
+	return cursor;
+}
+
+Cursor* table_end(Table* table) {
+	Cursor* cursor = malloc(sizeof(Cursor));
+	cursor->table = table;
+	cursor->row_num = table->num_rows;
+	cursor->end_of_table = true;
+
+	return cursor;
+}
+
 void *get_page(Pager* pager, uint32_t page_num) {
 	// バリデーション
 	if(page_num > TABLE_MAX_PAGES) {
@@ -168,15 +195,23 @@ void *get_page(Pager* pager, uint32_t page_num) {
 	return pager->pages[page_num];
 }
 
-// 指定された行がテーブルのどの位置にあるのかを計算する
-void* row_slot(Table* table, uint32_t row_num) {
+// カーソルが指している行の位置を取得する
+void* cursor_value(Cursor* cursor) {
+	uint32_t row_num = cursor->row_num;
 	uint32_t page_num = row_num / ROWS_PER_PAGE; // 指定された行がどのページにあるのかを算出
-	void* page = get_page(table->pager, page_num);
+	void* page = get_page(cursor->table->pager, page_num);
 
 	// 指定された行がどのテーブルのどの位置にあるのかを算出
 	uint32_t row_offset = row_num % ROWS_PER_PAGE;	// ページで見たときの行の位置を算出
 	uint32_t byte_offset = row_offset * ROW_SIZE;	// バイト単位に変換
 	return page + byte_offset;						// テーブル全体から見た行の位置を算出（指定した行のページの位置から行の位置までのバイト数を足したところ）
+}
+
+void cursor_advance(Cursor* cursor) {
+	cursor->row_num += 1;
+	if(cursor->row_num >= cursor->table->num_rows) {
+		cursor->end_of_table = true;
+	}
 }
 
 InputBuffer* new_input_buffer() {
@@ -347,25 +382,35 @@ PrepareResult prepare_statement(InputBuffer* input_buffer, Statement* statement)
 void print_row(Row* row) {
 	printf("(%d, %s, %s)\n", row->id, row->username, row->email);
 }
+
 ExecuteResult execute_insert(Statement* statement, Table* table) {
 	if(table->num_rows >= TABLE_MAX_ROWS) {
 		return EXECUTE_TABLE_FULL;
 	}
 
 	Row* row_to_insert = &(statement->row_to_insert);
+	Cursor* cursor = table_end(table);
 
-	serialize_row(row_to_insert, row_slot(table, table->num_rows));
+	serialize_row(row_to_insert, cursor_value(cursor));
 	table->num_rows += 1;
+
+	free(cursor);
 
 	return EXECUTE_SUCCESS;
 }
 
 ExecuteResult execute_select(Statement* statement, Table* table) {
+	Cursor* cursor = table_start(table);
+
 	Row row;
-	for(uint32_t i = 0; i < table->num_rows; i++) {
-		deserialize_row(row_slot(table, i), &row);
+	while(!(cursor->end_of_table)) {
+		deserialize_row(cursor_value(cursor), &row);
 		print_row(&row);
+		cursor_advance(cursor);
 	}
+
+	free(cursor);
+
 	return EXECUTE_SUCCESS;
 }
 
